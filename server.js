@@ -1,4 +1,3 @@
-// server.js (SSE + server->B2 progress with axios + progress-stream)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -11,6 +10,8 @@ const B2 = require('backblaze-b2');
 const axios = require('axios');
 const progress = require('progress-stream');
 const { v4: uuidv4 } = require('uuid');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -18,7 +19,6 @@ app.use(express.json());
 
 const uploadDir = path.join(__dirname, 'uploads');
 
-// Multer - store temporarily on disk
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     await fs.mkdir(uploadDir, { recursive: true });
@@ -32,7 +32,6 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// MySQL pool
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -42,7 +41,6 @@ const pool = mysql.createPool({
   connectionLimit: 10
 });
 
-// Backblaze client (authorize lazily)
 const b2 = new B2({
   accountId: process.env.B2_ACCOUNT_ID,
   applicationKey: process.env.B2_APPLICATION_KEY
@@ -51,6 +49,10 @@ const b2 = new B2({
 let cachedDownloadUrl = null;
 let lastAuthTime = 0;
 const AUTH_TTL_MS = 5 * 60 * 1000;
+
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 20 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 20 });
+const axiosInst = axios.create({ httpAgent, httpsAgent, timeout: 0, maxContentLength: Infinity, maxBodyLength: Infinity });
 
 async function ensureAuthorized() {
   const now = Date.now();
@@ -67,112 +69,63 @@ async function getFreshUploadUrl() {
   return { uploadUrl: res.data.uploadUrl, uploadAuthToken: res.data.authorizationToken };
 }
 
-// --- SSE store ---
-// simple in-memory map of uploadId => response objects (SSE connections)
 const sseClients = new Map();
-
-// SSE endpoint: client connects here to receive progress events
 app.get('/events/:uploadId', (req, res) => {
   const uploadId = req.params.uploadId;
-  // set headers for SSE
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive'
-  });
-  // Node 18+ has res.flushHeaders; safe to call if available
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
-
-  // send an initial comment to keep connection alive
   res.write(`:ok\n\n`);
-
-  // store client
   sseClients.set(uploadId, res);
-
-  // cleanup when client disconnects
-  req.on('close', () => {
-    sseClients.delete(uploadId);
-  });
+  req.on('close', () => sseClients.delete(uploadId));
 });
-
-// helper to send SSE events
 function sendSse(uploadId, event, payload) {
   const res = sseClients.get(uploadId);
   if (!res) return;
   const data = JSON.stringify(payload);
-  // SSE event format
   res.write(`event: ${event}\n`);
-  // data lines: split into \n lines prefixed by "data: "
   data.split('\n').forEach(line => res.write(`data: ${line}\n`));
-  res.write('\n'); // end of event
+  res.write('\n');
 }
 
-// Upload to Backblaze using axios + progress-stream
 async function uploadStreamToBackblaze(uploadUrl, uploadAuthToken, filePath, destFileName, uploadId) {
-  // get file size
   const stat = await fs.stat(filePath);
   const total = stat.size;
 
-  // create read stream
-  const readStream = fsSync.createReadStream(filePath);
+  const readStream = fsSync.createReadStream(filePath, { highWaterMark: 64 * 1024 });
 
-  // progress-stream wrapper
-  const prog = progress({ length: total, time: 100 }); // emits every 100ms
+  const prog = progress({ length: total, time: 200 });
   readStream.pipe(prog);
 
-  // Build axios request: stream as data, required headers:
-  // - Authorization: uploadAuthToken
-  // - X-Bz-File-Name: encoded file name (Backblaze expects raw fileName header)
-  // - Content-Length
-  // - X-Bz-Content-Sha1: do_not_verify (Backblaze allows this)
   const headers = {
     Authorization: uploadAuthToken,
     'X-Bz-File-Name': encodeURIComponent(destFileName),
     'Content-Length': total,
     'X-Bz-Content-Sha1': 'do_not_verify',
-    'Content-Type': 'b2/x-auto' // generic; Backblaze doesn't require exact
+    'Content-Type': 'b2/x-auto'
   };
 
-  // listen to progress and forward to SSE
   prog.on('progress', (p) => {
-    const percent = Math.round(p.percentage);
-    // payload: fileName, percent, loaded, total
-    sendSse(uploadId, 'progress', { fileName: destFileName, percent, loaded: p.transferred, total });
+    sendSse(uploadId, 'progress', { fileName: destFileName, percent: Math.round(p.percentage) });
   });
 
-  // perform axios POST with the prog stream as body
-  const axiosRes = await axios({
-    method: 'post',
-    url: uploadUrl,
+  const axiosRes = await axiosInst.post(uploadUrl, prog, {
     headers,
-    data: prog,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity, // allow large uploads
-    validateStatus: status => status >= 200 && status < 300 // only treat 2xx as success
+    validateStatus: status => status >= 200 && status < 300
   });
 
-  return axiosRes.data; // backblaze upload response
+  return axiosRes.data;
 }
 
-// Upload helper that uses axios streaming and preserves retry-on-401 behaviour
 async function uploadFileToB2WithProgress(localPath, destFileName, mimeType, uploadId) {
   await ensureAuthorized();
 
   const attempt = async () => {
     const { uploadUrl, uploadAuthToken } = await getFreshUploadUrl();
     try {
-      // stream upload with progress
       const b2Res = await uploadStreamToBackblaze(uploadUrl, uploadAuthToken, localPath, destFileName, uploadId);
-      // construct public url
       const fileUrl = `${cachedDownloadUrl}/file/${process.env.B2_BUCKET_NAME}/${encodeURIComponent(destFileName)}`;
-      return {
-        fileId: b2Res.fileId,
-        fileName: destFileName,
-        fileUrl,
-        size: (await fs.stat(localPath)).size
-      };
+      return { fileId: b2Res.fileId, fileName: destFileName, fileUrl, size: (await fs.stat(localPath)).size };
     } catch (err) {
-      // axios will throw for non-2xx; check if it's 401
       const status = err?.response?.status;
       if (status === 401) throw { retryable401: true, inner: err };
       throw err;
@@ -183,7 +136,6 @@ async function uploadFileToB2WithProgress(localPath, destFileName, mimeType, upl
     return await attempt();
   } catch (err) {
     if (err?.retryable401) {
-      // re-authorize and retry once
       cachedDownloadUrl = null;
       await ensureAuthorized();
       return await attempt();
@@ -192,64 +144,57 @@ async function uploadFileToB2WithProgress(localPath, destFileName, mimeType, upl
   }
 }
 
-// endpoint: upload multiple files (client passes uploadId as query param)
-app.post('/api/upload', upload.array('files', 1000), async (req, res) => {
-  const uploadId = req.query.uploadId || uuidv4(); // clients can provide uploadId; otherwise server generates one
-
-  if (!req.files || !req.files.length) return res.status(400).json({ message: 'No files uploaded', uploadId });
-
+function createWorkerPool(tasks, concurrency) {
+  let i = 0;
   const results = [];
-
-  try {
-    // process sequentially to keep progress predictable
-    for (const file of req.files) {
+  const run = async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= tasks.length) break;
       try {
-        // notify client we started this file
-        sendSse(uploadId, "started", {
-          fileName: file.filename,
-          originalName: file.originalname
-        });
-
-        const b2res = await uploadFileToB2WithProgress(file.path, file.filename, file.mimetype, uploadId);
-
-        // save metadata to DB
-        const [insertRes] = await pool.execute(
-          `INSERT INTO uploads (original_name, b2_file_name, b2_file_url, size, mime_type)
-           VALUES (?, ?, ?, ?, ?)`,
-          [file.originalname, b2res.fileName, b2res.fileUrl, b2res.size, file.mimetype]
-        );
-
-        // delete temp file
-        await fs.unlink(file.path).catch(()=>{});
-
-        results.push({
-          originalName: file.originalname,
-          b2FileName: b2res.fileName,
-          url: b2res.fileUrl,
-          size: b2res.size,
-          dbId: insertRes.insertId
-        });
-
-        // notify client that file finished
-        sendSse(uploadId, 'done', { fileName: b2res.fileName, url: b2res.fileUrl });
+        results[idx] = await tasks[idx]();
       } catch (err) {
-        // send error to client for this file
-        console.error('Upload error for', file.originalname, err?.response?.data || err.message || err);
-        sendSse(uploadId, 'error', { fileName: file.filename, error: (err?.response?.data || err.message || String(err)) });
-        await fs.unlink(file.path).catch(()=>{});
-        results.push({ originalName: file.originalname, error: err?.response?.data || err.message || String(err) });
+        results[idx] = { error: err };
       }
     }
+  };
+  const workers = new Array(Math.min(concurrency, tasks.length)).fill(0).map(() => run());
+  return Promise.all(workers).then(() => results);
+}
 
-    // all done - send final event (client may still listen)
-    sendSse(uploadId, 'finished', { results });
+app.post('/api/upload', upload.array('files', 1000), async (req, res) => {
+  const uploadId = req.query.uploadId || uuidv4();
+  if (!req.files || !req.files.length) return res.status(400).json({ message: 'No files uploaded', uploadId });
 
-    return res.json({ success: true, uploadId, results });
-  } catch (err) {
-    console.error('Unexpected error in upload route', err);
-    sendSse(uploadId, 'error', { error: err?.response?.data || err.message || String(err) });
-    return res.status(500).json({ success: false, message: err.message, uploadId });
+  try { await ensureAuthorized(); } catch (e) {
+    console.error('authorize before workers failed', e);
+    return res.status(500).json({ message: 'B2 authorize failed', error: String(e) });
   }
+
+  const tasks = req.files.map(file => async () => {
+    try {
+      sendSse(uploadId, 'started', { fileName: file.filename, originalName: file.originalname });
+      const b2res = await uploadFileToB2WithProgress(file.path, file.filename, file.mimetype, uploadId);
+      const [insertRes] = await pool.execute(
+        `INSERT INTO uploads (original_name, b2_file_name, b2_file_url, size, mime_type) VALUES (?, ?, ?, ?, ?)`,
+        [file.originalname, b2res.fileName, b2res.fileUrl, b2res.size, file.mimetype]
+      );
+      await fs.unlink(file.path).catch(()=>{});
+      sendSse(uploadId, 'done', { fileName: b2res.fileName, url: b2res.fileUrl });
+      return { originalName: file.originalname, b2FileName: b2res.fileName, url: b2res.fileUrl, size: b2res.size, dbId: insertRes.insertId };
+    } catch (err) {
+      console.error('Upload error for', file.originalname, err?.response?.data || err.message || err);
+      sendSse(uploadId, 'error', { fileName: file.filename, error: (err?.response?.data || err.message || String(err)) });
+      await fs.unlink(file.path).catch(()=>{});
+      return { originalName: file.originalname, error: err?.response?.data || err.message || String(err) };
+    }
+  });
+
+  const CONCURRENCY = Number(process.env.UPLOAD_CONCURRENCY || 4);
+  const results = await createWorkerPool(tasks, CONCURRENCY);
+
+  sendSse(uploadId, 'finished', { results });
+  return res.json({ success: true, uploadId, results });
 });
 
 const port = process.env.PORT || 4000;
